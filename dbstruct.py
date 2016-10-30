@@ -10,7 +10,7 @@ Base = declarative_base()
 # dn = distinguished name in ACI
 # ip = IP address as seen by ACI
 # last_seen = the time the flow was last seen, this is
-    # essentially the current time for each merge
+# 	essentially the current time for each merge
 class Endpoints(Base):
     __tablename__ = 'endpoints'
     dn = Column(String(100), primary_key=True)
@@ -25,7 +25,7 @@ class Endpoints(Base):
 # tcp_dst = destination TCP port, or 0 for default
 # protocol = protocol of the flow
 # last_seen = the time the flow was last seen, this is
-    # essentially the current time for each merge
+# 	essentially the current time for each merge
 # hits = integer to be incremented as the flow is seen
 class Flows(Base):
     __tablename__ = 'flows'
@@ -47,8 +47,10 @@ class Flows(Base):
 # tcp_dst = destination TCP port, or 0 for default
 # protocol = protocol of the flow
 # last_seen = the time the flow was last seen, this is
-    # essentially the current time for each merge
-# NOTE: for some reason wouldnt take string of 255 (should be max VARCHAR size), 100 is probably too short for some EPGs...
+# 	essentially the current time for each merge
+# NOTE: for some reason wouldnt take string of 255
+#	(should be max VARCHAR size), 100 is probably too
+#	short for some EPGs...
 class Contracts(Base):
     __tablename__ = 'contracts'
     src_epg = Column(String(100), primary_key=True)

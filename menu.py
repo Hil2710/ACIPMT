@@ -4,91 +4,81 @@ import ipaddress
 import re
 import acipdt
 import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
 import json
 
 
-def quit(userinput):
+# Function to exit program if user enters 'quit'
+def quit(userinput, logger):
     if userinput.lower() == 'quit':
+        logger.critical('Exiting program - user entered "quit" in a prompt.')
         sys.exit()
 
 
-def apic_info():
-    while True:
-        while True:
-            apic = input("Please input the APIC IP address: ")
-            quit(apic)
-            try:
-                ipaddress.ip_address(apic)
-                break
-            except:
-                print("Please enter a valid IP address in x.x.x.x format,"
-                      " or type 'quit'.")
-        user = input("Please enter the APIC userid [admin]: ")
-        user = user or 'admin'
-        quit(user)
-        pword = input("Please enter the APIC password [password]: ")
-        pword = pword or 'password'
-        quit(pword)
-        print(user, pword, apic)
-        try:
-            aci_login = acipdt.FabLogin(apic, user, pword)
-            cookies = aci_login.login()
-            break
-        except:
-            print("Something went wrong logging into ACI. Check your "
-                  "username and password.")
-    return(apic, user, pword, cookies)
-
-
-def gre_tunnel():
+# Function to gather info about GRE setup (and build if required)
+def gre_tunnel(logger):
+    logger.debug('Entered "gre_tunnel" function.')
     while True:
         gre = input("Do you already have a GRE tunnel setup on this "
                     "machine to receive SPAN data? ('y' or 'n') [y]: ")
         gre = gre or 'y'
-        quit(gre)
+        logger.debug('User entered "%s" for '
+                     '"Do you already have a GRE tunnel."' % gre)
+        quit(gre, logger)
         if gre.lower() == 'y' or gre.lower() == 'n':
             break
         else:
-            print("Please enter 'y' or 'n' only.")
+            logger.error('Invalid input of "%s" entered for "Do you already '
+                         'have a GRE tunnel". Enter a valid input or "quit".'
+                         % (gre))
 
-    print("Verifying ip_gre module is loaded.")
+    logger.debug('Verifying ip_gre module is loaded.')
     # Validate ip_gre module loaded before continuing
     try:
         p = subprocess.check_output(['lsmod | grep ip_gre'], shell=True)
+        logger.info('ip_gre module is loaded.')
     # If ip_gre not loaded, attempt ot remediate
     except:
-        print("ip_gre module not loaded, attempting to remediate...")
+        logger.error('ip_gre module not loaded, attempting to remediate...')
         # Attempt to load ip_gre module
         try:
             p = subprocess.call('modprobe ip_gre', shell=True)
             if p == 0:
+                logger.info('ip_gre module is loaded.')
                 pass
             elif p == 1:
+                logger.critical('FAILED attempting to load ip_gre, exiting.')
                 sys.exit()
         # If loading ip_gre fails, exit
         except:
-            print("Failed attempting to load ip_gre, exiting.")
+            logger.critical('FAILED attempting to load ip_gre, exiting.')
             sys.exit()
 
     # If user already has a tunnel
     if gre == 'y':
-
+        logger.debug('User has indicated gre tunnel already exists.')
         # Prompt user for tunnel name
         while True:
             tun_name = input("Enter the GRE tunnel interface name "
                              "(i.e. mon0, gre0) [mon0]: ")
             tun_name = tun_name or 'mon0'
-            quit(tun_name)
+            logger.debug('User entered "%s" for gre interface name.'
+                         % tun_name)
+            quit(tun_name, logger)
             # Check to see if tunnel exists
             try:
                 p = subprocess.check_output(['ifconfig', tun_name])
+                logger.debug('GRE tunnel %s exists.' % tun_name)
                 break
             # If tunnel doesn't exist, re-prompt user
             except:
-                print("Please enter a valid interface.")
+                logger.error('Invalid input of "%s" entered for "Enter the GRE'
+                             ' tunnel interface name. Enter valid tunnel name,'
+                             ' or type "quit".' % (tun_name))
 
         # Get source IP address of the tunnel
         while True:
+            logger.debug('Attempting to ascertain GRE source IP address.')
             # Try to get source IP of tunnel
             try:
                 p = subprocess.check_output(['ip addr show %s | grep link/gre'
@@ -99,43 +89,56 @@ def gre_tunnel():
                 ip = re.findall(r'[0-9]+(?:\.[0-9]+){3}', p)
                 ip.remove('0.0.0.0')
                 src_ip = ip[0]
+                logger.debug('Ascertained GRE source IP of "%s".' % src_ip)
                 break
             # If source IP cannot be sourced, prompt user for IP
             except:
-                print("Failed to get %s source IP address." % tun_name)
+                logger.error('Failed to get "%s" source IP address'
+                             % (tun_name))
                 src_ip = input("Manually enter tunnel source IP "
                                "(i.e. 1.1.1.1), or type 'quit' to exit: ")
-                quit(src_ip)
+                logger.debug('User entered "%s" for gre source IP address.'
+                             % src_ip)
+                quit(src_ip, logger)
                 # Validate user provided IP is legal
                 try:
                     ipaddress.ip_address(src_ip)
+                    logger.debug('User entered a valid IP address of "%s" for '
+                                 'GRE tunnel source IP.' % src_ip)
                     break
                 # Re-prompt user if IP is not legal
                 except:
-                    print("Please enter a valid IP address in x.x.x.x "
-                          "format, or type 'quit'.")
+                    logger.error('Invalid input of "%s" entered for '
+                                 '"GRE source IP Address". Enter a valid IP '
+                                 'address in x.x.x.x format, or type "quit".'
+                                 % (src_ip))
 
         # Validate tunnel is "up", remediate if necessary
         while True:
+            logger.debug('Attempting to ascertain if GRE tunnel is UP.')
             # Check ifconfig output for "UP"
             try:
                 p = subprocess.check_output(['ifconfig %s | grep UP'
                                             % tun_name], shell=True)
+                logger.debug('GRE tunnel appears to be up.')
                 break
             # If tunnel is not "UP"
             except:
+                logger.info('Tunnel does not seem to be up, attempting '
+                            'to bring up.')
                 try:
-                    print("Tunnel does not seem to be up, attempting "
-                          "to bring up.")
                     tun_bringup = ('ip link set %s up' % tun_name)
                     p = subprocess.Popen(tun_bringup, shell=True)
+                    logger.debug('Tunnel successfully brought up.')
                 # If tunnel cannot be brought up, exit
                 except:
-                    print("Failed to bring up tunnel, exiting.")
+                    logger.critical('FAILED to bring up tunnel "%s", exiting.'
+                                    % tun_name)
                     sys.exit()
 
         # Get IP address of tunnel itself
         while True:
+            logger.debug('Attemptig to ascertain IP of GRE tunnel itself.')
             # Check for tunnel IP Address
             try:
                 p = subprocess.check_output(['ifconfig %s | grep inet'
@@ -145,24 +148,33 @@ def gre_tunnel():
                 # find all IPs in string, remove all 0.0.0.0 entries
                 ip = re.findall(r'[0-9]+(?:\.[0-9]+){3}', p)
                 tun_ip = ip[0]
+                logger.debug('Ascertained GRE tunnel IP of "%s".' % tun_ip)
                 break
             # If tunnel IP cannot be fou,d prompt user
             except:
-                print("Failed to get %s IP address." % tun_name)
+                logger.error('Failed to get "%s" source IP address'
+                             % (tun_name))
                 tun_ip = input("\nManually enter interface %s IP address, or "
                                "type 'quit' to exit: " % tun_ip)
-                quit(tun_ip)
+                logger.debug('User entered "%s" for gre tunnel IP address.'
+                             % src_ip)
+                quit(tun_ip, logger)
                 # Check to see if user supplied IP is legal
                 try:
                     ipaddress.ip_address(tun_ip)
+                    logger.debug('User entered a valid IP address of "%s" for '
+                                 'GRE tunnel IP.' % src_ip)
                     break
                 # If IP not legal, re-prompt user
                 except:
-                    print("Please enter a valid IP address in "
-                          "x.x.x.x format, or type 'quit'.")
+                    logger.error('Invalid input of "%s" entered for '
+                                 '"GRE IP Address". Enter a valid IP '
+                                 'address in x.x.x.x format, or type "quit".'
+                                 % (src_ip))
 
     # If user does NOT have a tunnel
     if gre == 'n':
+        logger.debug('User already has indicated no gre tunnel exists.')
         # Load available interfaces for tunnel source
         p = subprocess.check_output(['ls /sys/class/net'], shell=True)
         p = p.decode('utf-8')
@@ -173,22 +185,32 @@ def gre_tunnel():
         p.remove('gretap0')
         # Ask user what source interface to use
         while True:
-            print("Available Interfaces:")
-            print(*p, sep='\n')
+            logger.debug('Prompting user to select GRE source interface.')
+            logger.info('Available Interfaces:')
+            for i in p:
+                logger.info(i)
             src_int = input("Enter the interface to use as the GRE tunnel "
                             "source interface [eth0]: ")
             src_int = src_int or 'eth0'
-            quit(src_int)
+            logger.debug('User entered "%s" for gre source interface.'
+                         % src_int)
+            quit(src_int, logger)
             # Check output to validate interface
             try:
                 p = subprocess.check_output(['ifconfig', src_int])
+                logger.debug('User entered a valid interface of "%s" '
+                             'for GRE source interface' % src_int)
                 break
             # Re-prompt user if interface is not valid
             except:
-                print("Please enter a valid interface.")
+                logger.error('Invalid input of "%s" entered for '
+                             '"GRE source interface". Enter a valid '
+                             'inteface, or type "quit".'
+                             % (src_int))
 
         # Get IP address of the tunnel source
         while True:
+            logger.debug('Attempting to ascertain GRE source IP address.')
             # Check output to glean IP address
             try:
                 p = subprocess.check_output(['ip addr show %s | grep inet'
@@ -198,23 +220,32 @@ def gre_tunnel():
                 # find all IPs in string, remove all 0.0.0.0 entries
                 ip = re.findall(r'[0-9]+(?:\.[0-9]+){3}', p)
                 src_ip = ip[0]
+                logger.debug('Ascertained GRE tunnel source IP of "%s".'
+                             % src_ip)
                 break
             # Prompt user to manually enter IP if fail to retreive IP
             except:
-                print("Failed to get %s IP address." % gre_src)
+                logger.error('Failed to get "%s" IP address'
+                             % (src_int))
                 src_ip = input("\nManually enter interface %s IP address, "
-                               "or type 'quit' to exit: " % gre_src)
-                quit(src_ip)
+                               "or type 'quit' to exit: " % src_int)
+                quit(src_ip, logger)
+                logger.debug('User entered "%s" for gre source IP address.'
+                             % src_ip)
                 # Validate IP address provided is legal
                 try:
                     ipaddress.ip_address(src_ip)
+                    logger.debug('User entered a valid IP address of "%s" for '
+                                 'GRE source IP.' % src_ip)
                     break
                 # If IP not legal, re-prompt user
                 except:
-                    print("Please enter a valid IP address in x.x.x.x "
-                          "format, or type 'quit'.")
+                    logger.error('Invalid input of "%s" entered for '
+                                 '"GRE source IP". Enter a valid '
+                                 'inteface, or type "quit".'
+                                 % (src_ip))
 
-        print("Validating that mon0 is not taken.")
+        logger.info('Validating that mon0 is not taken.')
         # Verify mon0 is not taken then load that as tunnel name
         p = subprocess.check_output(['ls /sys/class/net'], shell=True)
         p = p.decode('utf-8')
@@ -222,47 +253,96 @@ def gre_tunnel():
         # If mon0 is taken, exit
         # In the future add code to change tunnel number
         if 'mon0' in p:
-            print("Interface mon0 already exists, exiting.")
+            logger.critical('Interface "mon0" is already taken, exiting.')
             sys.exit()
         else:
+            logger.debug('Interface "mon0" is available.')
             tun_name = 'mon0'
 
-        print("Building tunnel interface.")
+        logger.info('Building tunnel interface.')
         # Build new tunnel interface
         try:
             p = subprocess.Popen(['ip tunnel add %s mode gre local %s'
                                  % (tun_name, src_ip)], shell=True)
+            logger.debug('Interface "mon0" successfully created.')
         # If building tunnel interface fails, exit
         except:
-            print("Failed to create tunnel interface. Exiting")
+            logger.critical('FAILED to create tunnel interface, exiting.')
             sys.exit()
 
-        print("Assigning IP address to tunnel.")
+        logger.info('Assigning IP address to tunnel.')
         # Assign IP address to Tunnel
         tun_ip = '1.1.1.1'
         # Assign IP to tunnel
         try:
             p = subprocess.Popen(['sudo ip addr add %s/30 dev %s'
                                  % (tun_ip, tun_name)], shell=True)
+            logger.debug('IP successfully assinged to interface "mon0".')
         # If tunnel IP assignment fails, exit
         except:
-            print("Failed to add IP address to tunnel. Exiting")
+            logger.critical('FAILED to add IP to interface "mon0".')
             sys.exit()
 
-        print("Bringing up tunnel interface.")
+        logger.info('Bringing up tunnel "mon0".')
         # Bring up tunnel
         try:
             tun_bringup = ('ip link set %s up' % tun_name)
             p = subprocess.Popen(tun_bringup, shell=True)
+            logger.debug('Tunnel "mon0" successfully brought up.')
         # If tunnel bringup fails, exit
         except:
-            print("Failed to bring up tunnel, exiting")
+            logger.critical('FAILED bring up "mon0", exiting.')
             sys.exit()
 
+    # return src_ip, tun_name and tun_ip to top_menu
+    logger.debug('GRE Tunnel functionality complete, returning tunnel name of'
+                '"%s", tunnel IP of "%s", and tunnel source IP of "%s" to '
+                'top_menu.' % (tun_name, tun_ip, src_ip))
     return(src_ip, tun_name, tun_ip)
 
 
-def aci_span(apic, cookies, src_ip, tun_ip):
+# Function to gather APIC information and validate it
+def apic_info(logger):
+    logger.debug('Entered "apic_info" function.')
+    while True:
+        while True:
+            apic = input("Please input the APIC IP address: ")
+            logger.debug('User entered "%s" for APIC ip' % apic)
+            quit(apic, logger)
+            try:
+                ipaddress.ip_address(apic)
+                break
+            except:
+                logger.error('User entered an invalid IP address of "%s", '
+                             'Please enter a valid IP address in x.x.x.x '
+                             'format, or type "quit"' % apic)
+        user = input("Please enter the APIC userid [admin]: ")
+        user = user or 'admin'
+        logger.debug('User entered "%s" for APIC user' % user)
+        quit(user, logger)
+        pword = input("Please enter the APIC password [password]: ")
+        pword = pword or 'password'
+        logger.debug('User entered [redacted] for APIC password')
+        quit(pword, logger)
+        try:
+            aci_login = acipdt.FabLogin(apic, user, pword)
+            cookies = aci_login.login()
+            logger.info('Successfully verified APIC login information.')
+            break
+        except:
+            logger.error('FAILED to log into APIC w/ provided information.'
+                         ' APIC = "%s", User = "%s"' % (apic, user))
+
+    # return apic, user, password, and cookies to top_menu
+    logger.debug('APIC Info functionality complete, returning APIC IP of'
+                 '"%s", user of "%s", and password of "%s" to '
+                 'top_menu.' % (apic, user, pword))
+    return(apic, user, pword, cookies)
+
+
+# Function to build ACI SPAN configurations if required
+def aci_span(apic, cookies, src_ip, tun_ip, logger):
+    logger.debug('Entered "aci_span" function.')
     # Convert src_ip and tun_ip (which was created in the gre func)
     # to dest_ip, tun_src_ip (as we are now working on opposite end
     # of the tunnel)
@@ -274,102 +354,131 @@ def aci_span(apic, cookies, src_ip, tun_ip):
         cfg_aci = input("Do you already have an ACI SPAN session setup to "
                         "point to this server? ('y' or 'n') [y]: ")
         cfg_aci = cfg_aci or 'y'
-        quit(cfg_aci)
+        logger.debug('User entered "%s" for '
+                     '"Do you already have an ACI SPAN session."' % cfg_aci)
+        quit(cfg_aci, logger)
         if cfg_aci.lower() == 'y' or cfg_aci.lower() == 'n':
             break
         else:
-            print("Please enter 'y' or 'n' only.")
+            logger.error('Invalid input of "%s" entered for "Do you already '
+                         'have an ACI SPAN session". Enter a valid input or '
+                         '"quit".' % (cfg_aci))
 
     # If user does not have ACI SPAN, prompt and configure
     if cfg_aci == 'n':
         # Prompt user for SPAN Source Information
         while True:
             aci_srctn = input("Which ACI Tenant in ACI is your SPAN "
-                              "destination group?: ")
+                              "source group?: ")
+            logger.debug('User entered "%s" for "ACI Tenant for SPAN '
+                         'source"' % aci_srctn)
             aci_srcap = input("In Tenant %s, which Application Profile will "
                               "the SPAN be sourced from?: " % aci_srctn)
+            logger.debug('User entered "%s" for "ACI App Profile for SPAN '
+                         'source"' % aci_srcap)
             aci_srcepg = input("In Tenant %s Application Profile %s, which "
                                "EPG will the SPAN be sourced from?: " %
                                (aci_srctn, aci_srcap))
+            logger.debug('User entered "%s" for "ACI EPG for SPAN '
+                         'source"' % aci_srcepg)
 
             # Validate the input supplied by the user
-            print("Validating ACI Tenant, Application Profile, and "
-                  "EPG exists.")
+            logger.info('Validating ACI Tenant, Application Profile, and '
+                        'EPG exists.')
             s = requests.Session()
             try:
                 r = s.get('https://%s/api/node/mo/uni/tn-%s/ap-%s/epg-%s.json'
                           % (apic, aci_srctn, aci_srcap, aci_srcepg),
                           cookies=cookies, verify=False)
                 status = r.status_code
+                logger.debug('Received status code "%s" from APIC while '
+                             'attempting to validate user input.' % status)
             except:
-                print("Failed to query APIC, exiting.")
+                logger.critical('FAILED to query APIC, exiting.')
                 sys.exit()
             payload = json.loads(r.text)
             payload_len = len(payload['imdata'])
             if payload_len == 1:
+                logger.debug('Users input for ACI source SPAN validated.')
                 break
             else:
-                print("Seems you entered an invalid Tenant, AP, or EPG. "
-                      "Try again or type 'quit'.")
+                logger.error('It seems you entered an invalid Tenant, AP, '
+                             'or EPG. Try again, or type "quit".')
 
         # Prompt user for SPAN Destination Information
         while True:
             aci_dsttn = input("Which ACI Tenant in ACI is your SPAN "
                               "destination group?: ")
+            logger.debug('User entered "%s" for "ACI Tenant for SPAN '
+                         'destination"' % aci_dsttn)
             aci_dstap = input("In Tenant %s, which Application Profile "
                               "will the SPAN be destined for?: " % aci_dsttn)
+            logger.debug('User entered "%s" for "ACI App Profile for SPAN '
+                         'source"' % aci_dstap)
             aci_dstepg = input("In Tenant %s Application Profile %s, which "
                                "EPG will the SPAN be destined for?: "
                                % (aci_dsttn, aci_dstap))
+            logger.debug('User entered "%s" for "ACI EPG for SPAN '
+                         'source"' % aci_dstepg)
 
             # Validate the input supplied by the user
-            print("Validating ACI Tenant, Application Profile, and "
-                  "EPG exists.")
+            logger.info('Validating ACI Tenant, Application Profile, and '
+                        'EPG exists.')
             s = requests.Session()
             try:
                 r = s.get('https://%s/api/node/mo/uni/tn-%s/ap-%s/epg-%s.json'
                           % (apic, aci_dsttn, aci_dstap, aci_dstepg),
                           cookies=cookies, verify=False)
                 status = r.status_code
+                logger.debug('Received status code "%s" from APIC while '
+                             'attempting to validate user input.' % status)
             except:
-                print("Failed to query APIC, exiting.")
+                logger.critical('FAILED to query APIC, exiting.')
                 sys.exit()
             payload = json.loads(r.text)
             payload_len = len(payload['imdata'])
             if payload_len == 1:
+                logger.debug('Users input for ACI source SPAN validated.')
                 break
             else:
-                print("Seems you entered an invalid Tenant, AP, or EPG. "
-                      "Try again or type 'quit'.")
+                logger.error('It seems you entered an invalid Tenant, AP, '
+                             'or EPG. Try again, or type "quit".')
 
         # Initialize the Tshoot Class, then build the SPAN session
-        print("Creating SPAN Source.")
+        logger.info('Creating SPAN Source.')
         aci_span = acipdt.TshootPol(apic, cookies)
         try:
             aci_span.span_src(aci_srctn, 'ACI-PMT-Src', 'enabled', 'both',
                               aci_srcap, aci_srcepg, 'ACI-PMT-Dst',
                               'created,modified')
+            logger.debug('Created ACI SPAN source.')
         except:
-            print("Failed to create ACI SPAN Source. Exiting.")
+            logger.critical('FAILED to create ACI SPAN source, exiting.')
             sys.exit()
 
-        print("Creating SPAN Destination.")
+        logger.info('Creating SPAN Destination.')
         try:
             aci_span.span_dst(aci_srctn, 'ACI-PMT-Dst', aci_dsttn,
                               aci_dstap, aci_dstepg, dst_ip, tun_src_ip,
                               'created,modified')
+            logger.debug('Created ACI SPAN Destination.')
         except:
-            print("Failed to create ACI SPAN Destination. Exiting.")
+            logger.critical('FAILED to create ACI SPAN destination, exiting.')
             sys.exit()
 
+        logger.debug('ACI SPAN functionality complete, returning to top_menu.')
 
-def tshark_setup():
-    print("In seconds (s), minutes (m), hours (h), or days (d), how "
-          "long would you like the SPAN to run?")
+
+# Function to gather information required to run Tshark
+def tshark_setup(logger):
+    logger.debug('Entered "aci_span" function.')
+    logger.info('In seconds (s), minutes (m), hours (h), or days (d), how '
+                'long would you like the SPAN to run?')
     while True:
         tshark_duration = input("Enter your selection "
                                 "(i.e. 1s, 5m, 10h or 1d): ")
-        quit(tshark_duration)
+        logger.debug('User entered "%s" for tshark duration.')
+        quit(tshark_duration, logger)
         if (tshark_duration[-1] == 's' or
             tshark_duration[-1] == 'm' or
             tshark_duration[-1] == 'h' or
@@ -379,10 +488,11 @@ def tshark_setup():
                     duration = int(duration)
                     break
                 except:
-                        print("Please enter a valid integer "
-                              "before time suffix.")
+                    logger.error('User entered "%s" please enter a valid '
+                                 'integer before time suffix, or type "quit".')
         else:
-            print("Please enter a valid time suffix (i.e. 'm', 'h', or 'd'.")
+            logger.error('User entered "%s" please enter a vlid time suffix, '
+                         '(i.e. "s", "m", "h", or "d", or type "quit".')
 
     if tshark_duration[-1] == 's':
         tshark_duration = duration
@@ -394,26 +504,38 @@ def tshark_setup():
         tshark_duration = duration * 60 * 60 * 12
 
     tshark_duration = int(tshark_duration)
+
+    logger.debug('Tshark duration = %s seconds' % tshark_duration)
     return(tshark_duration)
 
 
-def top_menu():
+# Main menu function
+def top_menu(logger):
+    logger.debug('Entering menu.')
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
     # want people to be able to start this w/ command line args, but
     # if they havent passed any, run this
     print("Welcome to the ACI Probable Mapping Tool!")
     print("From any prompt type 'quit' to exit program.")
 
-    # get apic info from user and validate login
-    (apic, user, pword, cookies) = apic_info()
-
     # process gre tunnel bring up
-    (src_ip, tun_name, tun_ip) = gre_tunnel()
+    logger.debug('Loading gre tunnel.')
+    (src_ip, tun_name, tun_ip) = gre_tunnel(logger)
+
+    # get apic info from user and validate login
+    logger.debug('Loading apic info.')
+    (apic, user, pword, cookies) = apic_info(logger)
 
     # process aci span bring up
-    aci_span(apic, cookies, src_ip, tun_ip)
+    logger.debug('Loading aci span.')
+    aci_span(apic, cookies, src_ip, tun_ip, logger)
 
     # process tshark duration information
-    tshark_duration = tshark_setup()
+    logger.debug('Loading tshark setup.')
+    tshark_duration = tshark_setup(logger)
 
     # return tshark_duration and the tunnel interface name
+    logger.debug('Menu functionality complete, returning tunnel name of "%s",'
+                'and duration for tshark of "%s" to main.' %
+                (tun_name, tshark_duration))
     return(tun_name, tshark_duration)

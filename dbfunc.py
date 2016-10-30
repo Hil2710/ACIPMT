@@ -1,21 +1,17 @@
 from dbstruct import Base, Endpoints, Flows, Contracts, engine
 from sqlalchemy import func
 import requests
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
 import json
 import datetime
 import os
 
 
-# move this func to somewhere else, has nothign to do w/ the db
 def current_endpoints(apic, cookies, session):
     s = requests.Session()
     r = s.get('https://%s/api/class/fvCEp.json'
               % (apic), cookies=cookies, verify=False)
     payload = json.loads(r.text)
     payload_len = len(payload['imdata'])
-    current_endpoints_dict = {}
-    current_time = datetime.datetime.now()
     for x in range(0, payload_len):
         try:
             ip = payload['imdata'][x]['fvCEp']['attributes']['ip']
