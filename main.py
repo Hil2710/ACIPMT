@@ -1,5 +1,6 @@
 from dbstruct import Base, engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import scoped_session
 import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 import acilogin
@@ -54,7 +55,7 @@ def main():
     logger.debug('Create DB session.')
     Base.metadata.bind = engine
     DBSession = sessionmaker(bind=engine)
-    session = DBSession()
+    session = scoped_session(DBSession)
     # Disable urllib3 InsecureRequestWarnings
     requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -76,12 +77,12 @@ def main():
         cycle = 'a'
         logger.debug('TShark duration less than 120 seconds, beginning single'
                      ' TShark capture.')
-        shark.tshark_process(tun_name, duration, cycle)
-        logger.debug('Beginning Tshark conversion from pcapng -> CSV.')
-        shark.tshark_convert(session, cycle)
+        shark.tshark_process(tun_name, duration, cycle, logger)
+        logger.debug('Beginning TShark conversion from pcapng -> CSV.')
+        shark.tshark_convert(session, cycle, logger)
     else:
         logger.debug('TShark duration is over 120 seconds. Beginning A/B '
-                     'Tshark captures.')
+                     'TShark captures.')
         while tshark_duration > 0:
             if tshark_duration - 60 >= 0:
                 duration = 60
@@ -91,12 +92,22 @@ def main():
                 tshark_duration = tshark_duration - tshark_duration
             cycle = next(cycles)
             logger.debug('Begin TShark process for cycle "%s".' % (cycle))
-            shark.tshark_process(tun_name, duration, cycle)
+            shark.tshark_process(tun_name, duration, cycle, logger)
             logger.debug('Begin TShark convert for cycle "%s".' % (cycle))
-            t = threading.Thread(target=shark.tshark_convert,
-                                 args=(session, cycle))
-            t.start()
+            thread = 't-' + cycle
+            thread = threading.Thread(target=shark.tshark_convert,
+                                      args=(session, cycle, logger))
+            thread.start()
 
+    # Test sleeping to allow the threads to finish
+    # (i.e. to allow the SQL conns to close)
+
+    logger.debug('Pausing for TShark Convert threads to complete.')
+    time.sleep(30)
+
+    # Closing the session... need to fix all the session shit here,
+    # this is a crappy "fix"
+    session.close()
     # This should probably only run at the "end" of a batch -- i.e. if we run
     # tshark for one week, this should run maybe once every 6 hours or
     # something to keep the DB clean(ish)
@@ -109,15 +120,8 @@ def main():
     # Test "cleaning" udp contracts
     logger.debug('Loading clean udp contracts.')
     dbfunc.clean_udp_contracts(session)
-
-    # Sleep whilst waiting for the processing to complete
-    # Should look into checking if the thread is complete -
-    # but will need to figure out how to make that not fail
-    # out for the times where we dont thread it (i.e. under 120)
-    logger.debug('Pausing for thread to complete.')
-    time.sleep(10)
     # Clean up files when done
-    logger.debug('Loading tshark clean.')
+    logger.debug('Loading TShark clean.')
     shark.tshark_clean()
 
     logger.debug('Program complete, exiting.')
