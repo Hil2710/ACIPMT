@@ -29,6 +29,8 @@ class Endpoints(Base):
 # hits = integer to be incremented as the flow is seen
 class Flows(Base):
     __tablename__ = 'flows'
+    src_mac = Column(String(17))
+    dst_mac = Column(String(17))
     src_ip = Column(String(15), primary_key=True)
     dst_ip = Column(String(15), primary_key=True)
     tcp_src = Column(String(5), default=0)

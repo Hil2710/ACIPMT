@@ -7,13 +7,11 @@ import acilogin
 import dbfunc
 import shark
 import menu
-import itertools
-import threading
-import time
 import logging
 import logging.handlers
 
 
+# Setup logging
 def log():
     # Create a logger named 'logger'
     setup_log = logging.getLogger('logger')
@@ -42,6 +40,7 @@ def log():
     return(logger)
 
 
+# Main, call menu and proceed from there
 def main():
     # Load log setup
     logger = log()
@@ -65,16 +64,14 @@ def main():
     (aci_ip, aci_cookies) = acilogin.aci_login()
     # Log into ACI, grab current endpoints, and write to DB
     logger.debug('Capturing current endpoints from APIC.')
-    dbfunc.current_endpoints(aci_ip, aci_cookies, session)
+    dbfunc.current_endpoints(aci_ip, aci_cookies, session, logger)
     # Remove stale endpoints
     logger.debug('Removing stale endpoints from DB.')
-    dbfunc.clean_endpoints(session)
+    dbfunc.clean_endpoints(session, logger)
 
-    tshark_cycles = ['a', 'b']
-    cycles = itertools.cycle(tshark_cycles)
     if tshark_duration < 120:
         duration = tshark_duration
-        cycle = 'a'
+        cycle = 1
         logger.debug('TShark duration less than 120 seconds, beginning single'
                      ' TShark capture.')
         shark.tshark_process(tun_name, duration, cycle, logger)
@@ -83,6 +80,7 @@ def main():
     else:
         logger.debug('TShark duration is over 120 seconds. Beginning A/B '
                      'TShark captures.')
+        cycle = 1
         while tshark_duration > 0:
             if tshark_duration - 60 >= 0:
                 duration = 60
@@ -90,20 +88,16 @@ def main():
             else:
                 duration = tshark_duration
                 tshark_duration = tshark_duration - tshark_duration
-            cycle = next(cycles)
-            logger.debug('Begin TShark process for cycle "%s".' % (cycle))
+            logger.debug('Begin TShark process for cycle "%s".' % (str(cycle)))
             shark.tshark_process(tun_name, duration, cycle, logger)
-            logger.debug('Begin TShark convert for cycle "%s".' % (cycle))
-            thread = 't-' + cycle
-            thread = threading.Thread(target=shark.tshark_convert,
-                                      args=(session, cycle, logger))
-            thread.start()
+            cycle += 1
 
-    # Test sleeping to allow the threads to finish
-    # (i.e. to allow the SQL conns to close)
+    total_cycles = int(cycle)
 
-    logger.debug('Pausing for TShark Convert threads to complete.')
-    time.sleep(30)
+    while cycle > 0:
+        logger.debug('Begin TShark convert for cycle "%s".' % (str(cycle)))
+        shark.tshark_convert(session, cycle, logger)
+        cycle -= 1
 
     # Closing the session... need to fix all the session shit here,
     # this is a crappy "fix"
@@ -113,16 +107,16 @@ def main():
     # something to keep the DB clean(ish)
     # Test creating contract table
     logger.debug('Loading build contracts.')
-    dbfunc.build_contracts(session)
+    dbfunc.build_contracts(session, logger)
     # Test "cleaning" tcp contracts
     logger.debug('Loading clean tcp contracts.')
-    dbfunc.clean_tcp_contracts(session)
+    dbfunc.clean_tcp_contracts(session, logger)
     # Test "cleaning" udp contracts
     logger.debug('Loading clean udp contracts.')
-    dbfunc.clean_udp_contracts(session)
+    dbfunc.clean_udp_contracts(session, logger)
     # Clean up files when done
     logger.debug('Loading TShark clean.')
-    shark.tshark_clean()
+    shark.tshark_clean(total_cycles, logger)
 
     logger.debug('Program complete, exiting.')
 

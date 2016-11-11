@@ -30,9 +30,11 @@ def tshark_convert(session, cycle, logger):
     if os.path.isfile(tshark_output):
         tshark_csvrun = ('runuser -l acipmt -c '
                          '"tshark -o erspan.fake_erspan:TRUE -r %s -n '
-                         '-T fields -E separator=, -e ip.src -e ip.dst '
-                         '-e tcp.srcport -e tcp.dstport -e udp.srcport '
-                         '-e udp.dstport -e ip.proto > %s"' %
+                         '-T fields -E separator=, -e eth.src -e eth.dst '
+                         '-e ip.src -e ip.dst '
+                         '-e tcp.srcport -e tcp.dstport '
+                         '-e udp.srcport -e udp.dstport '
+                         '-e ip.proto > %s"' %
                          (tshark_output, tshark_csvoutput))
         p = subprocess.Popen(tshark_csvrun, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, shell=True)
@@ -40,18 +42,21 @@ def tshark_convert(session, cycle, logger):
             print(line)
         p.wait()
         logger.debug('TShark convert for cycle "%s" complete.' % (cycle))
-        dbfunc.csv_to_db(session, cycle)
-        print("Completed processing and adding to DB.")
+        dbfunc.csv_to_db(session, cycle, logger)
+        logger.debug('Completed processing for cycle "%s" and adding to DB.'
+                     % (cycle))
     else:
         pass
 
 
-def tshark_clean():
-    if os.path.isfile('capture-a.pcapng'):
-        os.remove('capture-a.pcapng')
-    if os.path.isfile('capture-b.pcapng'):
-        os.remove('capture-b.pcapng')
-    if os.path.isfile('capture-a.csv'):
-        os.remove('capture-a.csv')
-    if os.path.isfile('capture-b.csv'):
-        os.remove('capture-b.csv')
+def tshark_clean(total_cycles, logger):
+    while total_cycles > 0:
+        if os.path.isfile('capture-%s.pcapng' % (str(total_cycles))):
+            logger.debug('Removing file "capture-%s.pcapng"' %
+                         (str(total_cycles)))
+            os.remove('capture-%s.pcapng' % (str(total_cycles)))
+        if os.path.isfile('capture-%s.csv' % (str(total_cycles))):
+            logger.debug('Removing file "capture-%s.csv"' %
+                         (str(total_cycles)))
+            os.remove('capture-%s.csv' % (str(total_cycles)))
+        total_cycles -= 1

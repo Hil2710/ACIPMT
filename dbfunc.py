@@ -1,5 +1,5 @@
 from dbstruct import Endpoints, Flows, Contracts
-from sqlalchemy import func
+from collections import Counter
 import requests
 import json
 import datetime
@@ -7,7 +7,8 @@ import os
 import ipaddress
 
 
-def current_endpoints(apic, cookies, session):
+# Query current endpoints in ACI
+def current_endpoints(apic, cookies, session, logger):
     s = requests.Session()
     r = s.get('https://%s/api/class/fvCEp.json'
               % (apic), cookies=cookies, verify=False)
@@ -17,9 +18,9 @@ def current_endpoints(apic, cookies, session):
         try:
             ip = payload['imdata'][x]['fvCEp']['attributes']['ip']
             dn = payload['imdata'][x]['fvCEp']['attributes']['dn']
-        except:
-            print("Failed to parse the IP and DN of an endpoint for"
-                  " some reason.")
+        except Exception as e:
+            logger.error('Failed to parse the IP and DN of an endpoint, '
+                         'exception: %s' % (e))
             pass
         else:
             try:
@@ -29,12 +30,17 @@ def current_endpoints(apic, cookies, session):
                 session.merge(eps)
                 # Commit to the DB
                 session.commit()
-            except:
-                print("Failed to write an endpoint to the DB for some reason.")
+                logger.debug('Endpoint DN: %s, IP: %s merged into the DB' %
+                             (dn, ip))
+            except Exception as e:
+                logger.error('Failed to write an endpoint to the DB, '
+                             'exception: %s.' % (e))
                 pass
+    logger.debug('Finished capturing current endpoints and writing to DB.')
 
 
-def clean_endpoints(session):
+# Remove stale endpoints from the endpoints DB
+def clean_endpoints(session, logger):
     # Set 'maxage' time -- currently its 1.4 minutes for testing
     maxage = datetime.datetime.now() - datetime.timedelta(0.001)
     # Query all endpoints in the table older than maxage
@@ -50,25 +56,22 @@ def clean_endpoints(session):
         # Delete the endpoint and commit to the DB
         session.delete(del_eps)
         session.commit()
+        logger.debug('Removed endpoint "%s" from the database - REASON: '
+                     'exceeded max age.' % (del_eps.dn))
         x += 1
+    logger.debug('Finished removing stale endpoints from DB.')
 
 
-# function takes "flow data" which is an array of info from an individual flow
-# think this could be optimized? seems wasteful to ship each individual
-# flow as an array and pass that between functions...?
+# takes "flow data" which is an array of info from an individual flow
+# returns hit counts for this flow if it is already in DB
 def query_hitcount(session, flow_data):
-    # check to see if the flow already exists in the table
-    # note that the primary keys are src/dst ip and port (tcp or udp, if tcp udp = 0 and visa versa)
-    # if there is a flow already in the DB then we find the hits, if empty we make it 0 then increment
-    # if its already exists we just load that up as an int then increment
-    # if no flow exists we set the hits to 0 as we think this is the first time we saw the flow
     try:
-        flow = session.query(Flows).filter((Flows.src_ip == flow_data[0]) &
-                                           (Flows.dst_ip == flow_data[1]) &
-                                           (Flows.tcp_dst == flow_data[3]) &
-                                           (Flows.udp_dst == flow_data[5]) &
+        flow = session.query(Flows).filter((Flows.src_ip == flow_data[2]) &
+                                           (Flows.dst_ip == flow_data[3]) &
+                                           (Flows.tcp_dst == flow_data[5]) &
+                                           (Flows.udp_dst == flow_data[7]) &
                                            (Flows.protocol ==
-                                            flow_data[6])).one()
+                                            flow_data[8])).one()
         if flow.hits is None:
             hits = 0
         else:
@@ -81,8 +84,32 @@ def query_hitcount(session, flow_data):
     return(hits)
 
 
+# Deduplicates the CSV, but counts total "hits" for each flow
+def clean_csv(convert_cycle, logger):
+    entries = []
+    capfile = ('capture-%s.csv' % (convert_cycle))
+    logger.debug('capture-%s.csv being deduplicated.' % (convert_cycle))
+    with open(capfile, 'r') as f:
+        for row in f:
+            entries.append(row.strip('\n'))
+    caplen_start = len(entries)
+    counted_entries = Counter()
+    for x in entries:
+        counted_entries[x] += 1
+    with open(capfile, 'w') as f:
+        for k, v in counted_entries.items():
+            write_me = ','.join([k, str(v)])
+            f.write('%s\n' % (write_me))
+    with open(capfile, 'r') as f:
+        caplen_finish = sum(1 for row in f)
+    lines_removed = caplen_start - caplen_finish
+    logger.debug('capture-%s.csv deduplicated, consolidated %s lines.' %
+                 (convert_cycle, lines_removed))
+
+
 # function to read off the csv and import into the mariadb
-def csv_to_db(session, convert_cycle):
+def csv_to_db(session, convert_cycle, logger):
+    clean_csv(convert_cycle, logger)
     capfile = 'capture-%s.csv' % convert_cycle
     if os.path.isfile(capfile):
         with open(capfile, 'r') as f:
@@ -92,17 +119,18 @@ def csv_to_db(session, convert_cycle):
                 flow_data = line.split(',')
                 # grab hit count from above function for each individual flow
                 hits = query_hitcount(session, flow_data)
+                hits = hits + int(flow_data[9])
                 # if/elif/else to ensure that we have non-empty src/dst ip
                 # this just ensures that we ignore any L2 stuff
-                if flow_data[0] == '':
+                if flow_data[2] == '':
                     continue
-                if flow_data[1] == '':
+                if flow_data[3] == '':
                     continue
                 # IF we get ICMP redirects, we get a weird condition where
-                # TShark puts an IP in to the [2] and [3] positions in the
+                # TShark puts an IP in to the [4] and [5] positions in the
                 # row, catch this, then continue
                 try:
-                    if ipaddress.ip_address(flow_data[2]):
+                    if ipaddress.ip_address(flow_data[4]):
                         continue
                     else:
                         pass
@@ -110,43 +138,45 @@ def csv_to_db(session, convert_cycle):
                     pass
                 # Try to add flow to DB
                 try:
-                    flow = Flows(src_ip=flow_data[0],
-                                 dst_ip=flow_data[1],
-                                 tcp_src=flow_data[2],
-                                 tcp_dst=flow_data[3],
-                                 udp_src=flow_data[4],
-                                 udp_dst=flow_data[5],
-                                 protocol=flow_data[6],
+                    flow = Flows(src_mac=flow_data[0],
+                                 dst_mac=flow_data[1],
+                                 src_ip=flow_data[2],
+                                 dst_ip=flow_data[3],
+                                 tcp_src=flow_data[4],
+                                 tcp_dst=flow_data[5],
+                                 udp_src=flow_data[6],
+                                 udp_dst=flow_data[7],
+                                 protocol=flow_data[8],
                                  last_seen=current_time,
                                  hits=hits)
                     session.merge(flow)
                     session.commit()
                 except Exception as e:
-                    print("Failed adding a flow to the DB. Rolling back.")
-                    print("Exception: %s" % (e))
+                    logger.error('Failed adding a flow to the DB. Rolling '
+                                 'back. Exception: %s' % (e))
                     session.rollback()
+    logger.debug('Completed importing CSV data into DB.')
     return(True)
 
 
-# want to run this one infrequently and also make sure that its checking the time of the last_seen in EPs -- basically should only generate a contract if its been seen within last week or something
-# also need to put the src ports in because this will throw lots of whacky shit like a million contracts for tcp dst ports -- 
-# basically will want to delete all rows that have matching src / dst epg and dst port -- that should eliminate all the high order ports
-def build_contracts(session):
+# Function to parse flow data and build relevant contracts
+def build_contracts(session, logger):
     flow = session.query(Flows).all()
     session.close()
-    # snag the length of all flows (basically total count of flows)
-    # use this later to loop over each entry
+    # Loop over each entrie in "flow"
     flow_len = len(flow)
     for x in range(0, flow_len):
-        # had some issues parsing new lines and empty strings, so strip those off
+        # had some issues parsing new lines & empty strings, so strip those off
         # this leaves the protocol number
         protocol = flow[x].protocol.strip('\n').strip('')
         # we want to make sure protocol is indeed an integer (should be!)
         try:
             protocol = int(protocol)
         except:
+            logger.error('Encountered flow with an invalid protocol'
+                         'number. Protocol was "%s"' % (str(protocol)))
             continue
-        # for now we only care about 6 (tcp) and 17 (udp) for everything else skip
+        # for now we only care about 6(tcp) & 17(udp) for everything else skip
         if protocol == 6:
             protocol = 'tcp'
             tcp_src = flow[x].tcp_src
@@ -160,26 +190,68 @@ def build_contracts(session):
             udp_src = flow[x].udp_src
             udp_dst = flow[x].udp_dst
         else:
+            logger.debug('Skipping a flow for not being TCP or UDP, protocol '
+                         'ID is: %s' % (protocol))
             continue
+
         # Try to find the source EPG for the particular flow we are working on
-        # if it doesn't exist we enter "unknown" this means its not in the fabric (probably external)
+        # if it doesn't exist we enter "unknown"
+        src_mac = flow[x].src_mac.strip('\n').strip('')
         try:
-            src_epg = session.query(Endpoints).filter(Endpoints.ip == flow[x].src_ip).one()
+            src_ips = session.query(Endpoints).filter(Endpoints.ip ==
+                                                      flow[x].src_ip).all()
             session.close()
-            src_epg = src_epg.dn
         except:
+            logger.error('Failed to query DB while corelating a flow to '
+                         'endpoints.')
+        # If we receive more than 0 results from our query:
+        if len(src_ips) == 1:
+            src_epg = src_ips[0].dn
+        elif len(src_ips) > 1:
+            for i in src_ips:
+                logger.debug('Source IP address: %s matches multiple EPGs: %s'
+                             % (flow[x].src_ip, i.dn))
+            for i in src_ips:
+                if i.dn[-17:].lower() == src_mac:
+                    src_epg = i.dn
+                    break
+                else:
+                    src_epg = 'Multiple EGPs matching MAC/IP.'
+        # If we got 0 results from our query, then the EPG is unkown
+        else:
+            logger.debug('Failed to match source IP: %s to any EPG in the'
+                         ' fabric' % (flow[x].dst_ip))
             src_epg = 'unkown'
-        # Do the same thing for the destination
+
+        # Do the same as above but for destination MAC
+        dst_mac = flow[x].dst_mac.strip('\n').strip('')
         try:
-            dst_epg = session.query(Endpoints).filter(Endpoints.ip == flow[x].dst_ip).one()
+            dst_ips = session.query(Endpoints).filter(Endpoints.ip ==
+                                                      flow[x].dst_ip).all()
             session.close()
-            dst_epg = dst_epg.dn
         except:
+            logger.error('Failed to query DB while corelating a flow to '
+                         'endpoints.')
+        # If we receive more than 0 results from our query:
+        if len(dst_ips) == 1:
+            dst_epg = dst_ips[0].dn
+        elif len(dst_ips) > 1:
+            for i in dst_ips:
+                logger.debug('Destination IP address: %s matches multiple '
+                             'EPGs: %s' % (flow[x].dst_ip, i.dn))
+            for i in dst_ips:
+                if i.dn[-17:].lower() == dst_mac:
+                    dst_epg = i.dn
+                    break
+                else:
+                    dst_epg = 'Multiple EGPs matching MAC/IP.'
+        # If we got 0 results from our query, then the EPG is unkown
+        else:
+            logger.debug('Failed to match destination IP: %s to any EPG in the'
+                         ' fabric' % (flow[x].dst_ip))
             dst_epg = 'unkown'
-        # Now we load an entry into the contracts table
-        # need to add in src port becauase we want to make sure that we have that so we can filter on it
-        # basically we may see flows inbound to an epg w/ high order destination ports (return http traffic for example)
-        # we want to be able to correlate all this and elimnate all that stuff -- this is up next
+
+        # Add entry to contracts table in DB
         contract = Contracts(src_epg=src_epg,
                              dst_epg=dst_epg,
                              tcp_src=tcp_src,
@@ -187,16 +259,18 @@ def build_contracts(session):
                              udp_src=udp_src,
                              udp_dst=udp_dst,
                              protocol=protocol,
-                             last_seen=func.now())
+                             last_seen=datetime.datetime.now())
         session.merge(contract)
         session.commit()
+        logger.debug('Created contract entry for flow between the following '
+                     'EPGs:\nSource: %s \nDestination: %s' %
+                     (src_epg, dst_epg))
         x += 1
 
 
-# This one should be ran infrequently as well -- it is designed to eliminate all the wonky src port contracts
-# Basically if a tcp session is 1025->80 then we dont need a contract for 80->1025, so this is designed
-# to eliminate those flows from the contract table (we will keep them in the flow table though just in case)
-def clean_tcp_contracts(session):
+# Attempt to eliminate redundant/reverse flow info (i.e. 1025->443 / 443->1025)
+def clean_tcp_contracts(session, logger):
+    # Query all TCP contracts
     tcp_ctrx = session.query(Contracts).filter(Contracts.protocol ==
                                                'tcp').all()
     # Get quantity of all tcp contracts
@@ -205,80 +279,98 @@ def clean_tcp_contracts(session):
     for x in range(0, tcp_ctrx_len):
         # for every tcp contract in the nested loop
         for y in range(0, tcp_ctrx_len):
-            # see if the src epg matches is also a destination epg from the query
+            # if the src epg [x] matches is also a destination epg [y]
             if tcp_ctrx[x].src_epg == tcp_ctrx[y].dst_epg:
-                # if it does, then see if the src and dst ports match (indicating return traffic)
+                # If the src and dst ports match (indicating return traffic)
                 if tcp_ctrx[x].tcp_src == tcp_ctrx[y].tcp_dst:
-                    # if both ports are ephemeral, leave them in
+                    # if both ports are ephemeral, leave them in and log
                     if (int(tcp_ctrx[x].tcp_src) > 1024 and
                         int(tcp_ctrx[y].tcp_src) > 1024):
-                            print("High order port on source EPG, leaving in "
-                                  "contract table. Issue is between following "
-                                  "EPGs.")
-                            print("Source EPG: " + tcp_ctrx[x].src_epg +
-                                  ", Source TCP:" + tcp_ctrx[x].tcp_src +
-                                  ", Destination TCP: " + tcp_ctrx[x].tcp_dst)
-                            print("Destination EPG: " + tcp_ctrx[x].src_epg +
-                                  ", Source TCP:" + tcp_ctrx[x].tcp_src +
-                                  ", Destination TCP: " + tcp_ctrx[x].tcp_dst)
-                            print("--------------")
+                            logger.debug('Flow with ephemeral ports in both '
+                                         'source and destination, leaving in '
+                                         'Contracts DB.\nFlow #1:\n'
+                                         'Source: %s:%s\nDestination: %s:%s\n'
+                                         'Flow #2:\nSource: %s:%s\n'
+                                         'Destination: %s:%s' %
+                                         (tcp_ctrx[x].src_epg,
+                                          tcp_ctrx[x].tcp_src,
+                                          tcp_ctrx[x].dst_epg,
+                                          tcp_ctrx[x].tcp_dst,
+                                          tcp_ctrx[y].src_epg,
+                                          tcp_ctrx[y].tcp_src,
+                                          tcp_ctrx[y].dst_epg,
+                                          tcp_ctrx[y].tcp_dst))
                     else:
+                        # find and delete flow w/ low order source port
                         if (int(tcp_ctrx[x].tcp_src) < 1025 and
                             int(tcp_ctrx[y].tcp_src) > 1024):
-                                print("Deleting Contract.")
-                                print("Source EPG: " + tcp_ctrx[x].src_epg +
-                                      ", Source TCP:" + tcp_ctrx[x].tcp_src +
-                                      ", Destination TCP: " +
-                                      tcp_ctrx[x].tcp_dst)
-                                print("Destination EPG: " +
-                                      tcp_ctrx[x].src_epg + ", Source TCP:" +
-                                      tcp_ctrx[x].tcp_src +
-                                      ", Destination TCP: " +
-                                      tcp_ctrx[x].tcp_dst)
-                                print("--------------")
+                                logger.debug('Flow with low order source port.'
+                                             ' Deleting unnecessary flow from '
+                                             'Contracts DB.\nFlow #1:\nSource:'
+                                             ' %s:%s\nDestination: %s:%s\n'
+                                             'Flow #2:\nSource: %s:%s\n'
+                                             'Destination: %s:%s' %
+                                             (tcp_ctrx[x].src_epg,
+                                              tcp_ctrx[x].tcp_src,
+                                              tcp_ctrx[x].dst_epg,
+                                              tcp_ctrx[x].tcp_dst,
+                                              tcp_ctrx[y].src_epg,
+                                              tcp_ctrx[y].tcp_src,
+                                              tcp_ctrx[y].dst_epg,
+                                              tcp_ctrx[y].tcp_dst))
                                 session.delete(tcp_ctrx[x])
                                 session.commit()
 
 
-def clean_udp_contracts(session):
+# Attempt to eliminate redundant/reverse flow info (i.e. 1025->443 / 443->1025)
+def clean_udp_contracts(session, logger):
+    # Query all UDP contracts
     udp_ctrx = session.query(Contracts).filter(Contracts.protocol ==
                                                'udp').all()
-    # Get quantity of all tcp contracts
+    # Get quantity of all udp contracts
     udp_ctrx_len = len(udp_ctrx)
-    # for every tcp contract
+    # for every udp contract
     for x in range(0, udp_ctrx_len):
-        # for every tcp contract in the nested loop
+        # for every udp contract in the nested loop
         for y in range(0, udp_ctrx_len):
-            # see if the src epg matches is also a destination epg from the query
+            # if the src epg [x] matches is also a destination epg [y]
             if udp_ctrx[x].src_epg == udp_ctrx[y].dst_epg:
-                # if it does, then see if the src and dst ports match (indicating return traffic)
+                # If the src and dst ports match (indicating return traffic)
                 if udp_ctrx[x].udp_src == udp_ctrx[y].udp_dst:
-                    # if both ports are ephemeral, leave them in
+                    # if both ports are ephemeral, leave them in and log
                     if (int(udp_ctrx[x].udp_src) > 1024 and
                         int(udp_ctrx[y].udp_src) > 1024):
-                            print("High order port on source EPG, leaving in "
-                                  "contract table. Issue is between following "
-                                  "EPGs.")
-                            print("Source EPG: " + udp_ctrx[x].src_epg +
-                                  ", Source TCP:" + udp_ctrx[x].udp_src +
-                                  ", Destination UDP: " + udp_ctrx[x].udp_dst)
-                            print("Destination EPG: " + udp_ctrx[x].src_epg +
-                                  ", Source TCP:" + udp_ctrx[x].udp_src +
-                                  ", Destination UDP: " + udp_ctrx[x].udp_dst)
-                            print("--------------")
+                            logger.debug('Flow with ephemeral ports in both '
+                                         'source and destination, leaving in '
+                                         'Contracts DB.\nFlow #1:\n'
+                                         'Source: %s:%s\nDestination: %s:%s\n'
+                                         'Flow #2:\nSource: %s:%s\n'
+                                         'Destination: %s:%s' %
+                                         (udp_ctrx[x].src_epg,
+                                          udp_ctrx[x].udp_src,
+                                          udp_ctrx[x].dst_epg,
+                                          udp_ctrx[x].udp_dst,
+                                          udp_ctrx[y].src_epg,
+                                          udp_ctrx[y].udp_src,
+                                          udp_ctrx[y].dst_epg,
+                                          udp_ctrx[y].udp_dst))
                     else:
+                        # find and delete flow w/ low order source port
                         if (int(udp_ctrx[x].udp_src) < 1025 and
                             int(udp_ctrx[y].udp_src) > 1024):
-                                print("Deleting Contract.")
-                                print("Source EPG: " + udp_ctrx[x].src_epg +
-                                      ", Source TCP:" + udp_ctrx[x].udp_src +
-                                      ", Destination UDP: " +
-                                      udp_ctrx[x].udp_dst)
-                                print("Destination EPG: " +
-                                      udp_ctrx[x].src_epg + ", Source TCP:" +
-                                      udp_ctrx[x].udp_src +
-                                      ", Destination UDP: " +
-                                      udp_ctrx[x].udp_dst)
-                                print("--------------")
+                                logger.debug('Flow with low order source port.'
+                                             ' Deleting unnecessary flow from '
+                                             'Contracts DB.\nFlow #1:\nSource:'
+                                             ' %s:%s\nDestination: %s:%s\n'
+                                             'Flow #2:\nSource: %s:%s\n'
+                                             'Destination: %s:%s' %
+                                             (udp_ctrx[x].src_epg,
+                                              udp_ctrx[x].udp_src,
+                                              udp_ctrx[x].dst_epg,
+                                              udp_ctrx[x].udp_dst,
+                                              udp_ctrx[y].src_epg,
+                                              udp_ctrx[y].udp_src,
+                                              udp_ctrx[y].dst_epg,
+                                              udp_ctrx[y].udp_dst))
                                 session.delete(udp_ctrx[x])
                                 session.commit()
